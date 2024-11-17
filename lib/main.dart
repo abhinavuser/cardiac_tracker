@@ -79,6 +79,8 @@ class _MainNavigationState extends State<MainNavigation> {
 
 /// Home Screen: Displays real-time heart rate and other vital information
 class HomeScreen extends StatefulWidget {
+  const HomeScreen({Key? key}) : super(key: key);
+
   @override
   _HomeScreenState createState() => _HomeScreenState();
 }
@@ -87,18 +89,13 @@ class _HomeScreenState extends State<HomeScreen> {
   late WebSocketChannel channel;
   double heartRate = 0.0;
   List<FlSpot> ecgPoints = [];
-  List<double> recentValues = [];
-  Timer? updateTimer;
-  int peakCount = 0;
-  DateTime lastPeakTime = DateTime.now();
   bool isConnected = false;
-
+  Timer? updateTimer;
+  
   @override
   void initState() {
     super.initState();
     connectWebSocket();
-    // Update heart rate every 30 seconds instead of 5
-    updateTimer = Timer.periodic(Duration(seconds: 30), (_) => calculateHeartRate());
   }
 
   void connectWebSocket() {
@@ -107,128 +104,139 @@ class _HomeScreenState extends State<HomeScreen> {
       Uri.parse('ws://192.168.29.127:5000/socket.io/?EIO=4&transport=websocket'),
     );
     
-    channel.sink.add('40');  // Send connection message
+    channel.sink.add('40');
     
     channel.stream.listen(
-      (message) {
-        print('Received message: $message'); // Debug print
-        updateData(message);
+      (dynamic message) {
+        print('Received message: $message');
+        handleSocketMessage(message);
       },
       onError: (error) {
         print('WebSocket error: $error');
-        reconnectWebSocket();
+        setState(() {
+          isConnected = false;
+        });
+        Future.delayed(Duration(seconds: 5), connectWebSocket);
       },
       onDone: () {
         print('WebSocket connection closed');
-        reconnectWebSocket();
+        setState(() {
+          isConnected = false;
+        });
+        Future.delayed(Duration(seconds: 5), connectWebSocket);
       },
     );
   }
 
-  void reconnectWebSocket() {
-    Future.delayed(Duration(seconds: 5), () {
-      if (mounted) {
-        print('Attempting to reconnect...');
-        connectWebSocket();
-      }
-    });
-  }
-
-  void updateData(dynamic message) {
+  void handleSocketMessage(dynamic message) {
     if (!mounted) return;
 
-    // Handle Socket.IO protocol messages
-    if (message.toString().startsWith('0') || 
-        message.toString().startsWith('40')) {
-      isConnected = true;
-      setState(() {});
+    // Handle connection messages
+    if (message.toString().startsWith('0') || message.toString().startsWith('40')) {
+      setState(() {
+        isConnected = true;
+      });
       return;
     }
 
     // Handle ping messages
     if (message.toString() == '2') {
-      channel.sink.add('3'); // Respond with pong
+      channel.sink.add('3');
       return;
     }
 
     try {
-      // Check if message starts with "42" (Socket.IO data message)
+      // Handle data messages
       if (message.toString().startsWith('42')) {
-        // Remove the "42" prefix and parse the JSON
-        final jsonStr = message.toString().substring(2);
-        final List<dynamic> data = json.decode(jsonStr);
+        String jsonStr = message.toString().substring(2);
+        print('Processing JSON: $jsonStr');
         
-        if (data[0] == 'ecg_data' && data[1] is Map) {
-          final value = (data[1]['value'] as num).toDouble();
-          print('Processed ECG value: $value'); // Debug print
-          
-          setState(() {
-            recentValues.add(value);
+        // Parse the outer message structure
+        List<dynamic> outerData = json.decode(jsonStr);
+        if (outerData[0] == "message") {
+          // Extract and parse the inner message
+          String innerMessage = outerData[1];
+          if (innerMessage.startsWith('42')) {
+            String innerJsonStr = innerMessage.substring(2);
+            List<dynamic> data = json.decode(innerJsonStr);
             
-            // Keep only last 50 values for the graph
-            if (recentValues.length > 50) {
-              recentValues.removeAt(0);
+            if (data[0] == "ecg_data" && data[1] is Map) {
+              final Map<String, dynamic> ecgData = data[1];
+              final double value = (ecgData['value'] as num).toDouble();
+              final double newHeartRate = (ecgData['heart_rate'] as num).toDouble();
+              
+              print('Processed value: $value, heart rate: $newHeartRate');
+              
+              setState(() {
+                heartRate = newHeartRate;
+                
+                // Add new point to the graph
+                if (ecgPoints.length > 100) {
+                  ecgPoints.removeAt(0);
+                }
+                ecgPoints.add(FlSpot(
+                  ecgPoints.isEmpty ? 0 : ecgPoints.length.toDouble(),
+                  value
+                ));
+                
+                // Reindex x-coordinates
+                ecgPoints = List.generate(
+                  ecgPoints.length,
+                  (index) => FlSpot(index.toDouble(), ecgPoints[index].y),
+                );
+              });
             }
-
-            // Update graph points
-            ecgPoints = List.generate(
-              recentValues.length,
-              (index) => FlSpot(index.toDouble(), recentValues[index]),
-            );
-
-            // Detect peaks for heart rate
-            if (value > 0) { // Adjust threshold as needed
-              peakCount++;
-            }
-          });
+          }
         }
       }
-    } catch (e) {
+    } catch (e, stackTrace) {
       print('Error processing message: $e');
+      print('Stack trace: $stackTrace');
     }
   }
 
-  void calculateHeartRate() {
-    if (!mounted) return;
-    setState(() {
-      // Calculate BPM based on peaks counted in the last 30 seconds
-      heartRate = (peakCount * 2).toDouble(); // Multiply by 2 to get BPM (30 seconds → 1 minute)
-      print('Calculated heart rate: $heartRate from $peakCount peaks'); // Debug print
-      peakCount = 0;
-    });
-  }
-
-  @override
-  void dispose() {
-    channel.sink.close();
-    updateTimer?.cancel();
-    super.dispose();
+  Color _getHeartRateColor(double heartRate) {  // Renamed parameter for clarity
+    if (heartRate < 60) return Colors.blue;  // Bradycardia
+    if (heartRate > 100) return Colors.red;  // Tachycardia
+    return Colors.green;  // Normal
   }
 
   Widget _buildGraph() {
     return Container(
       height: 300,
-      child: LineChart(
-        LineChartData(
-          gridData: FlGridData(show: true),
-          titlesData: FlTitlesData(show: false),
-          borderData: FlBorderData(show: true),
-          minX: max(0, ecgPoints.length.toDouble() - 200), // Show last 200 points
-          maxX: ecgPoints.length.toDouble(),
-          minY: -500,
-          maxY: 500,
-          lineBarsData: [
-            LineChartBarData(
-              spots: ecgPoints,
-              isCurved: true,
-              barWidth: 1,
-              color: Colors.red,
-              dotData: FlDotData(show: false),
-              belowBarData: BarAreaData(show: false),
+      padding: EdgeInsets.all(16),
+      child: ecgPoints.isEmpty
+          ? Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text('Waiting for ECG data...'),
+                ],
+              ),
+            )
+          : LineChart(
+              LineChartData(
+                gridData: FlGridData(show: true),
+                titlesData: FlTitlesData(show: false),
+                borderData: FlBorderData(show: true),
+                minX: 0,
+                maxX: 100,
+                minY: -2,
+                maxY: 2,
+                lineBarsData: [
+                  LineChartBarData(
+                    spots: ecgPoints,
+                    isCurved: true,
+                    barWidth: 1,
+                    color: Colors.red,
+                    dotData: FlDotData(show: false),
+                    belowBarData: BarAreaData(show: false),
+                  ),
+                ],
+              ),
             ),
-          ],
-        ),
-      ),
     );
   }
 
@@ -269,13 +277,24 @@ class _HomeScreenState extends State<HomeScreen> {
                         style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
                       ),
                       SizedBox(height: 20),
-                      Text(
-                        '${heartRate.toStringAsFixed(1)} bpm',
-                        style: TextStyle(
-                          fontSize: 48,
-                          fontWeight: FontWeight.bold,
-                          color: heartRate > 100 ? Colors.red : Colors.green,
-                        ),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            Icons.favorite,
+                            color: Colors.red,
+                            size: 40,
+                          ),
+                          SizedBox(width: 10),
+                          Text(
+                            '${heartRate.toStringAsFixed(0)} BPM',
+                            style: TextStyle(
+                              fontSize: 48,
+                              fontWeight: FontWeight.bold,
+                              color: _getHeartRateColor(heartRate),
+                            ),
+                          ),
+                        ],
                       ),
                     ],
                   ),
@@ -297,9 +316,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   ),
                   child: Padding(
                     padding: const EdgeInsets.all(8.0),
-                    child: ecgPoints.isEmpty
-                        ? Center(child: CircularProgressIndicator())
-                        : _buildGraph(),
+                    child: _buildGraph(),
                   ),
                 ),
                 SizedBox(height: 40),
@@ -328,6 +345,13 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    channel.sink.close();
+    updateTimer?.cancel();
+    super.dispose();
   }
 }
 
