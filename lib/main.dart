@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
-import 'dart:math'; // for simulated heart rate changes
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'dart:async';
+import 'dart:math';
+import 'dart:convert';
+import 'package:web_socket_channel/io.dart';
 import 'package:fl_chart/fl_chart.dart'; // Make sure the package is imported
 
 void main() => runApp(CardiacMonitoringApp());
@@ -80,91 +84,246 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  double heartRate = 72.0;
+  late WebSocketChannel channel;
+  double heartRate = 0.0;
+  List<FlSpot> ecgPoints = [];
+  List<double> recentValues = [];
+  Timer? updateTimer;
+  int peakCount = 0;
+  DateTime lastPeakTime = DateTime.now();
+  bool isConnected = false;
 
   @override
   void initState() {
     super.initState();
-    Future.delayed(Duration.zero, _updateHeartRate);
+    connectWebSocket();
+    // Update heart rate every 30 seconds instead of 5
+    updateTimer = Timer.periodic(Duration(seconds: 30), (_) => calculateHeartRate());
   }
 
-  void _updateHeartRate() {
-    setState(() {
-      heartRate = 60 + (Random().nextDouble() * 40); // Simulated heart rate
-      heartRate = double.parse(heartRate.toStringAsFixed(4)); // Limit to 4 decimals
+  void connectWebSocket() {
+    print('Connecting to WebSocket...');
+    channel = WebSocketChannel.connect(
+      Uri.parse('ws://192.168.29.127:5000/socket.io/?EIO=4&transport=websocket'),
+    );
+    
+    channel.sink.add('40');  // Send connection message
+    
+    channel.stream.listen(
+      (message) {
+        print('Received message: $message'); // Debug print
+        updateData(message);
+      },
+      onError: (error) {
+        print('WebSocket error: $error');
+        reconnectWebSocket();
+      },
+      onDone: () {
+        print('WebSocket connection closed');
+        reconnectWebSocket();
+      },
+    );
+  }
+
+  void reconnectWebSocket() {
+    Future.delayed(Duration(seconds: 5), () {
+      if (mounted) {
+        print('Attempting to reconnect...');
+        connectWebSocket();
+      }
     });
-    Future.delayed(Duration(seconds: 2), _updateHeartRate); // Simulate updates
+  }
+
+  void updateData(dynamic message) {
+    if (!mounted) return;
+
+    // Handle Socket.IO protocol messages
+    if (message.toString().startsWith('0') || 
+        message.toString().startsWith('40')) {
+      isConnected = true;
+      setState(() {});
+      return;
+    }
+
+    // Handle ping messages
+    if (message.toString() == '2') {
+      channel.sink.add('3'); // Respond with pong
+      return;
+    }
+
+    try {
+      // Check if message starts with "42" (Socket.IO data message)
+      if (message.toString().startsWith('42')) {
+        // Remove the "42" prefix and parse the JSON
+        final jsonStr = message.toString().substring(2);
+        final List<dynamic> data = json.decode(jsonStr);
+        
+        if (data[0] == 'ecg_data' && data[1] is Map) {
+          final value = (data[1]['value'] as num).toDouble();
+          print('Processed ECG value: $value'); // Debug print
+          
+          setState(() {
+            recentValues.add(value);
+            
+            // Keep only last 50 values for the graph
+            if (recentValues.length > 50) {
+              recentValues.removeAt(0);
+            }
+
+            // Update graph points
+            ecgPoints = List.generate(
+              recentValues.length,
+              (index) => FlSpot(index.toDouble(), recentValues[index]),
+            );
+
+            // Detect peaks for heart rate
+            if (value > 0) { // Adjust threshold as needed
+              peakCount++;
+            }
+          });
+        }
+      }
+    } catch (e) {
+      print('Error processing message: $e');
+    }
+  }
+
+  void calculateHeartRate() {
+    if (!mounted) return;
+    setState(() {
+      // Calculate BPM based on peaks counted in the last 30 seconds
+      heartRate = (peakCount * 2).toDouble(); // Multiply by 2 to get BPM (30 seconds → 1 minute)
+      print('Calculated heart rate: $heartRate from $peakCount peaks'); // Debug print
+      peakCount = 0;
+    });
+  }
+
+  @override
+  void dispose() {
+    channel.sink.close();
+    updateTimer?.cancel();
+    super.dispose();
+  }
+
+  Widget _buildGraph() {
+    return Container(
+      height: 300,
+      child: LineChart(
+        LineChartData(
+          gridData: FlGridData(show: true),
+          titlesData: FlTitlesData(show: false),
+          borderData: FlBorderData(show: true),
+          minX: max(0, ecgPoints.length.toDouble() - 200), // Show last 200 points
+          maxX: ecgPoints.length.toDouble(),
+          minY: -500,
+          maxY: 500,
+          lineBarsData: [
+            LineChartBarData(
+              spots: ecgPoints,
+              isCurved: true,
+              barWidth: 1,
+              color: Colors.red,
+              dotData: FlDotData(show: false),
+              belowBarData: BarAreaData(show: false),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      decoration: BoxDecoration(
-        image: DecorationImage(
-          image: AssetImage('assets/bg.jpg'),
-          fit: BoxFit.cover,
+    return Scaffold(
+      body: Container(
+        decoration: BoxDecoration(
+          image: DecorationImage(
+            image: AssetImage('assets/bg.jpg'),
+            fit: BoxFit.cover,
+          ),
         ),
-      ),
-      child: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: <Widget>[
-              Container(
-                padding: EdgeInsets.all(16),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(16),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.grey.withOpacity(0.5),
-                      spreadRadius: 2,
-                      blurRadius: 5,
-                      offset: Offset(0, 3),
-                    ),
-                  ],
-                ),
-                child: Column(
-                  children: [
-                    Text(
-                      'Real-Time Heart Rate',
-                      style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
-                    ),
-                    SizedBox(height: 20),
-                    Text(
-                      '$heartRate bpm',
-                      style: TextStyle(
-                        fontSize: 48,
-                        fontWeight: FontWeight.bold,
-                        color: heartRate > 100 ? Colors.red : Colors.green,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-              SizedBox(height: 40),
-              ElevatedButton(
-                onPressed: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(builder: (context) => ReportScreen()),
-                  );
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.red,
-                  shape: RoundedRectangleBorder(
+        child: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                Container(
+                  padding: EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
                     borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.grey.withOpacity(0.3),
+                        spreadRadius: 2,
+                        blurRadius: 5,
+                        offset: Offset(0, 3),
+                      ),
+                    ],
                   ),
-                  padding: EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                  child: Column(
+                    children: [
+                      Text(
+                        'Real-Time Heart Rate',
+                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                      ),
+                      SizedBox(height: 20),
+                      Text(
+                        '${heartRate.toStringAsFixed(1)} bpm',
+                        style: TextStyle(
+                          fontSize: 48,
+                          fontWeight: FontWeight.bold,
+                          color: heartRate > 100 ? Colors.red : Colors.green,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-                child: Text(
-                  'View Detailed Report',
-                  style: TextStyle(fontSize: 18, color: Colors.white),
+                SizedBox(height: 40),
+                Container(
+                  height: 300,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(16),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.grey.withOpacity(0.3),
+                        spreadRadius: 2,
+                        blurRadius: 5,
+                        offset: Offset(0, 3),
+                      ),
+                    ],
+                  ),
+                  child: Padding(
+                    padding: const EdgeInsets.all(8.0),
+                    child: ecgPoints.isEmpty
+                        ? Center(child: CircularProgressIndicator())
+                        : _buildGraph(),
+                  ),
                 ),
-              ),
-            ],
+                SizedBox(height: 40),
+                ElevatedButton(
+                  onPressed: () {
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(builder: (context) => ReportScreen()),
+                    );
+                  },
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.blue,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    padding: EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                  ),
+                  child: Text(
+                    'View Detailed Report',
+                    style: TextStyle(fontSize: 18, color: Colors.white),
+                  ),
+                ),
+              ],
+            ),
           ),
         ),
       ),
