@@ -3,6 +3,7 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 import 'dart:async';
 import 'dart:math';
 import 'dart:convert';
+import 'package:http/http.dart' as http;
 import 'package:web_socket_channel/io.dart';
 import 'package:fl_chart/fl_chart.dart'; // Make sure the package is imported
 
@@ -79,131 +80,133 @@ class _MainNavigationState extends State<MainNavigation> {
 
 /// Home Screen: Displays real-time heart rate and other vital information
 class HomeScreen extends StatefulWidget {
-  const HomeScreen({Key? key}) : super(key: key);
-
   @override
   _HomeScreenState createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  late WebSocketChannel channel;
   double heartRate = 0.0;
   List<FlSpot> ecgPoints = [];
-  bool isConnected = false;
   Timer? updateTimer;
+  bool isLoading = true;
+  String errorMessage = '';
+  
+  // Update this with your computer's IP address
+  final String serverUrl = 'http://192.168.14.62:5000/ecg-data';
   
   @override
   void initState() {
     super.initState();
-    connectWebSocket();
+    startDataFetching();
   }
 
-  void connectWebSocket() {
-    print('Connecting to WebSocket...');
-    channel = WebSocketChannel.connect(
-      Uri.parse('ws://192.168.29.127:5000/socket.io/?EIO=4&transport=websocket'),
-    );
+  void startDataFetching() {
+    // Fetch immediately on start
+    fetchECGData();
     
-    channel.sink.add('40');
-    
-    channel.stream.listen(
-      (dynamic message) {
-        print('Received message: $message');
-        handleSocketMessage(message);
-      },
-      onError: (error) {
-        print('WebSocket error: $error');
-        setState(() {
-          isConnected = false;
-        });
-        Future.delayed(Duration(seconds: 5), connectWebSocket);
-      },
-      onDone: () {
-        print('WebSocket connection closed');
-        setState(() {
-          isConnected = false;
-        });
-        Future.delayed(Duration(seconds: 5), connectWebSocket);
-      },
-    );
+    // Then set up periodic fetching
+    updateTimer = Timer.periodic(Duration(milliseconds: 100), (_) {
+      fetchECGData();
+    });
   }
 
-  void handleSocketMessage(dynamic message) {
-    if (!mounted) return;
-
-    // Handle connection messages
-    if (message.toString().startsWith('0') || message.toString().startsWith('40')) {
-      setState(() {
-        isConnected = true;
-      });
-      return;
-    }
-
-    // Handle ping messages
-    if (message.toString() == '2') {
-      channel.sink.add('3');
-      return;
-    }
-
+  Future<void> fetchECGData() async {
     try {
-      // Handle data messages
-      if (message.toString().startsWith('42')) {
-        String jsonStr = message.toString().substring(2);
-        print('Processing JSON: $jsonStr');
+      final response = await http.get(Uri.parse(serverUrl));
+      
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        final readings = List<Map<String, dynamic>>.from(data['readings']);
         
-        // Parse the outer message structure
-        List<dynamic> outerData = json.decode(jsonStr);
-        if (outerData[0] == "message") {
-          // Extract and parse the inner message
-          String innerMessage = outerData[1];
-          if (innerMessage.startsWith('42')) {
-            String innerJsonStr = innerMessage.substring(2);
-            List<dynamic> data = json.decode(innerJsonStr);
+        if (readings.isNotEmpty) {
+          setState(() {
+            isLoading = false;
+            errorMessage = '';
             
-            if (data[0] == "ecg_data" && data[1] is Map) {
-              final Map<String, dynamic> ecgData = data[1];
-              final double value = (ecgData['value'] as num).toDouble();
-              final double newHeartRate = (ecgData['heart_rate'] as num).toDouble();
-              
-              print('Processed value: $value, heart rate: $newHeartRate');
-              
-              setState(() {
-                heartRate = newHeartRate;
-                
-                // Add new point to the graph
-                if (ecgPoints.length > 100) {
-                  ecgPoints.removeAt(0);
-                }
-                ecgPoints.add(FlSpot(
-                  ecgPoints.isEmpty ? 0 : ecgPoints.length.toDouble(),
-                  value
-                ));
-                
-                // Reindex x-coordinates
-                ecgPoints = List.generate(
-                  ecgPoints.length,
-                  (index) => FlSpot(index.toDouble(), ecgPoints[index].y),
-                );
-              });
+            // Update heart rate from the latest reading
+            heartRate = readings.last['heart_rate'].toDouble();
+            
+            // Update ECG points
+            ecgPoints = readings.map((reading) {
+              return FlSpot(
+                ecgPoints.length.toDouble(),
+                reading['value'].toDouble(),
+              );
+            }).toList();
+            
+            // Keep only the last 100 points
+            if (ecgPoints.length > 100) {
+              ecgPoints = ecgPoints.sublist(ecgPoints.length - 100);
             }
-          }
+            
+            // Reindex x-coordinates
+            ecgPoints = List.generate(
+              ecgPoints.length,
+              (index) => FlSpot(index.toDouble(), ecgPoints[index].y),
+            );
+          });
         }
+      } else {
+        setState(() {
+          errorMessage = 'Server error: ${response.statusCode}';
+          isLoading = false;
+        });
       }
-    } catch (e, stackTrace) {
-      print('Error processing message: $e');
-      print('Stack trace: $stackTrace');
+    } catch (e) {
+      setState(() {
+        errorMessage = 'Connection error: $e';
+        isLoading = false;
+      });
+      print('Error fetching ECG data: $e');
     }
   }
 
-  Color _getHeartRateColor(double heartRate) {  // Renamed parameter for clarity
+  Color _getHeartRateColor(double heartRate) {
     if (heartRate < 60) return Colors.blue;  // Bradycardia
     if (heartRate > 100) return Colors.red;  // Tachycardia
     return Colors.green;  // Normal
   }
 
   Widget _buildGraph() {
+    if (isLoading) {
+      return Container(
+        height: MediaQuery.of(context).size.height * 0.4,
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('Initializing ECG...')
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (errorMessage.isNotEmpty) {
+      return Container(
+        height: MediaQuery.of(context).size.height * 0.4,
+        child: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.error_outline, color: Colors.red, size: 48),
+              SizedBox(height: 16),
+              Text(errorMessage),
+              SizedBox(height: 16),
+              ElevatedButton(
+                onPressed: startDataFetching,
+                child: Text('Retry'),
+              )
+            ],
+          ),
+        ),
+      );
+    }
+
     return Container(
-      height: 300,
+      height: MediaQuery.of(context).size.height * 0.4,
       padding: EdgeInsets.all(16),
       child: ecgPoints.isEmpty
           ? Center(
@@ -218,9 +221,33 @@ class _HomeScreenState extends State<HomeScreen> {
             )
           : LineChart(
               LineChartData(
-                gridData: FlGridData(show: true),
-                titlesData: FlTitlesData(show: false),
-                borderData: FlBorderData(show: true),
+                gridData: FlGridData(
+                  show: true,
+                  drawVerticalLine: true,
+                  horizontalInterval: 0.05,
+                  verticalInterval: 10,
+                  getDrawingHorizontalLine: (value) {
+                    return FlLine(
+                      color: Colors.grey.withOpacity(0.3),
+                      strokeWidth: 1,
+                    );
+                  },
+                  getDrawingVerticalLine: (value) {
+                    return FlLine(
+                      color: Colors.grey.withOpacity(0.3),
+                      strokeWidth: 1,
+                    );
+                  },
+                ),
+                titlesData: FlTitlesData(
+                  show: true,
+                  topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                  rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+                ),
+                borderData: FlBorderData(
+                  show: true,
+                  border: Border.all(color: Colors.grey.withOpacity(0.5)),
+                ),
                 minX: 0,
                 maxX: 100,
                 minY: -2,
@@ -229,7 +256,7 @@ class _HomeScreenState extends State<HomeScreen> {
                   LineChartBarData(
                     spots: ecgPoints,
                     isCurved: true,
-                    barWidth: 1,
+                    barWidth: 2,
                     color: Colors.red,
                     dotData: FlDotData(show: false),
                     belowBarData: BarAreaData(show: false),
@@ -240,24 +267,32 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      body: Container(
-        decoration: BoxDecoration(
-          image: DecorationImage(
-            image: AssetImage('assets/bg.jpg'),
-            fit: BoxFit.cover,
-          ),
+@override
+Widget build(BuildContext context) {
+  final screenHeight = MediaQuery.of(context).size.height;
+  final screenWidth = MediaQuery.of(context).size.width;
+  
+  return Scaffold(
+    body: Container(
+      decoration: BoxDecoration(
+        image: DecorationImage(
+          image: AssetImage('assets/bg.jpg'),
+          fit: BoxFit.cover,
         ),
-        child: Center(
+      ),
+      child: SafeArea(
+        child: SingleChildScrollView(
           child: Padding(
-            padding: const EdgeInsets.all(16.0),
+            padding: EdgeInsets.symmetric(
+              horizontal: screenWidth * 0.05,
+              vertical: screenHeight * 0.02,
+            ),
             child: Column(
-              mainAxisSize: MainAxisSize.min,
               children: <Widget>[
+                // Heart Rate Display
                 Container(
-                  padding: EdgeInsets.all(16),
+                  width: double.infinity,
+                  padding: EdgeInsets.all(screenHeight * 0.02),
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(16),
@@ -274,22 +309,25 @@ class _HomeScreenState extends State<HomeScreen> {
                     children: [
                       Text(
                         'Real-Time Heart Rate',
-                        style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold),
+                        style: TextStyle(
+                          fontSize: screenWidth * 0.06,
+                          fontWeight: FontWeight.bold
+                        ),
                       ),
-                      SizedBox(height: 20),
+                      SizedBox(height: screenHeight * 0.02),
                       Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           Icon(
                             Icons.favorite,
                             color: Colors.red,
-                            size: 40,
+                            size: screenWidth * 0.1,
                           ),
-                          SizedBox(width: 10),
+                          SizedBox(width: screenWidth * 0.03),
                           Text(
                             '${heartRate.toStringAsFixed(0)} BPM',
                             style: TextStyle(
-                              fontSize: 48,
+                              fontSize: screenWidth * 0.12,
                               fontWeight: FontWeight.bold,
                               color: _getHeartRateColor(heartRate),
                             ),
@@ -299,9 +337,12 @@ class _HomeScreenState extends State<HomeScreen> {
                     ],
                   ),
                 ),
-                SizedBox(height: 40),
+                
+                SizedBox(height: screenHeight * 0.03),
+                
+                // ECG Graph Container
                 Container(
-                  height: 300,
+                  width: double.infinity,
                   decoration: BoxDecoration(
                     color: Colors.white,
                     borderRadius: BorderRadius.circular(16),
@@ -314,12 +355,26 @@ class _HomeScreenState extends State<HomeScreen> {
                       ),
                     ],
                   ),
-                  child: Padding(
-                    padding: const EdgeInsets.all(8.0),
-                    child: _buildGraph(),
+                  child: Column(
+                    children: [
+                      Padding(
+                        padding: EdgeInsets.all(16),
+                        child: Text(
+                          'ECG Waveform',
+                          style: TextStyle(
+                            fontSize: screenWidth * 0.05,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                      _buildGraph(),
+                    ],
                   ),
                 ),
-                SizedBox(height: 40),
+                
+                SizedBox(height: screenHeight * 0.03),
+                
+                // Report Button
                 ElevatedButton(
                   onPressed: () {
                     Navigator.push(
@@ -332,11 +387,17 @@ class _HomeScreenState extends State<HomeScreen> {
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(16),
                     ),
-                    padding: EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+                    padding: EdgeInsets.symmetric(
+                      horizontal: screenWidth * 0.08,
+                      vertical: screenHeight * 0.02,
+                    ),
                   ),
                   child: Text(
                     'View Detailed Report',
-                    style: TextStyle(fontSize: 18, color: Colors.white),
+                    style: TextStyle(
+                      fontSize: screenWidth * 0.045,
+                      color: Colors.white,
+                    ),
                   ),
                 ),
               ],
@@ -344,12 +405,12 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ),
       ),
-    );
-  }
+    ),
+  );
+}
 
   @override
   void dispose() {
-    channel.sink.close();
     updateTimer?.cancel();
     super.dispose();
   }
